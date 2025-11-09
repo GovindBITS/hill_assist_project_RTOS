@@ -30,11 +30,27 @@ Both boards are PlatformIO projects; build each from its own folder (`Hillclimbi
 
 ## STM32 Firmware Overview
 
-* **IMU & Level Display** – The MPU9250 is sampled (200 Hz base configuration), filtered, and used to compute roll/pitch. The SSD1306 shows orientation, temperature, command/output PWM, and the hill-assist status.
-* **Motor Control** – User commands (left/right PWM) arrive via the ESP32 bridge. Hill-assist uses filtered pitch to add a *gradual* boost (see `kAssistPitchThresholdDeg`, `kAssistGainPerDeg`, `kAssistRampStep`). Outputs saturate at ±255.
-* **Brake Servos** – Two servos on PA5/PA6 act as disc brakes. When assist is enabled and both motor commands are zero, brakes auto-engage; otherwise they release. Manual commands (`BRAKE`, `RELEASE`) are available.
-* **Assist Toggle** – The PC14 latch switch directly controls `gAssistEnabled`. Toggling it updates the ESP32, OLED, and automatically reapplies releases.
-* **Telemetry & Logging** – All status lines include button state, assist state, brake state, command PWM, and applied PWM. Telemetry streams to the ESP32 (`STM_STATUS`, `STM_IMU`) and USB serial.
+The STM32 firmware now runs on top of **STM32duino FreeRTOS**. The old monolithic `loop()` logic has been split into dedicated tasks so timing-critical work (motors, brakes, IMU) cannot be starved by UI/telemetry updates.
+
+### FreeRTOS Task Map
+
+| Task (Stack words) | Priority | Cadence | Responsibilities |
+|--------------------|----------|---------|------------------|
+| `MotorControlTask` (768) | *High* (`tskIDLE+4`) | 5 ms | Pulls motor commands from a queue, blends hill-assist boost, writes TB6612 outputs, manages standby. |
+| `BrakeControlTask` (512) | *High* (`tskIDLE+4`) | 10 ms | Applies/releases brake servos from a queue, debounces the assist button so brakes react immediately. |
+| `ImuTask` (768) | *Medium* (`tskIDLE+3`) | 2 ms poll | Samples the MPU9250 at the configured interval, runs the tilt filter, updates the shared level state under a mutex. |
+| `CommunicationTask` (768) | *Medium* (`tskIDLE+3`) | 10 ms | Services the ESP32 UART, blinks the status LED, and periodically logs/streams telemetry using mutex-protected IMU snapshots. |
+| `DisplayTask` (512) | *Low* (`tskIDLE+1`) | 20 ms | Renders the OLED with the latest cached sample/state without blocking high-priority tasks. |
+
+Shared data (`gImuSample`, `gLevelState`) is protected by a mutex, while motor/brake requests flow through bounded FreeRTOS queues. This lets ESP commands enqueue new targets instantly without touching motor GPIO from lower-priority code.
+
+### Functional Blocks
+
+* **IMU & Level Display** — The MPU9250 is sampled (200 Hz base configuration), filtered, and used to compute roll/pitch. The SSD1306 shows orientation, temperature, command/output PWM, and the hill-assist status.
+* **Motor Control** — User commands (left/right PWM) arrive via the ESP32 bridge. Hill-assist uses filtered pitch to add a *gradual* boost (see `kAssistPitchThresholdDeg`, `kAssistGainPerDeg`, `kAssistRampStep`). Outputs saturate at ±255.
+* **Brake Servos** — Two servos on PA5/PA6 act as disc brakes. When assist is enabled and both motor commands are zero, brakes auto-engage; otherwise they release. Manual commands (`BRAKE`, `RELEASE`) are available.
+* **Assist Toggle** — The PC14 latch switch directly controls `gAssistEnabled`. Toggling it updates the ESP32, OLED, and automatically reapplies releases.
+* **Telemetry & Logging** — All status lines include button state, assist state, brake state, command PWM, and applied PWM. Telemetry streams to the ESP32 (`STM_STATUS`, `STM_IMU`) and USB serial.
 
 Key tuneables in `src/main.cpp`:
 
@@ -100,6 +116,8 @@ pio device monitor  # optional: view serial logs @115200
 
 The project uses the DFU bootloader (`upload_protocol = dfu`). Put the BlackPill into DFU mode when flashing.
 
+> **Dependency note:** `platformio.ini` already lists `STM32duino FreeRTOS`, `Adafruit SSD1306`, and `Adafruit GFX`. PlatformIO will fetch them automatically on the first `pio run`.
+
 ### ESP32 Companion (UPesy WROOM)
 
 ```bash
@@ -132,5 +150,3 @@ After flashing, connect your laptop to the `HillAssist-ESP32` Wi-Fi network and 
 * **IMU missing/OLED blank** – Verify PB7/PB8 and PB3/PB10 wiring and pull the STM32’s reset if the IMU cube fails to probe.
 
 ---
-
-
